@@ -2,14 +2,37 @@ import sys
 import time
 import logging
 import argparse
+import threading
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileModifiedEvent, FileDeletedEvent, FileMovedEvent
 
 
 class FileMonitorHandler(FileSystemEventHandler):
-    def __init__(self, logger: logging.Logger):
+    def __init__(self, logger: logging.Logger, debounce_seconds: float = 1.0):
         self.logger = logger
+        self.debounce_seconds = debounce_seconds
+        self._pending_timers: dict[str, threading.Timer] = {}
+        self._timers_lock = threading.Lock()
+
+    def _debounce(self, file_path: str, event_type: str, callback):
+        with self._timers_lock:
+            if file_path in self._pending_timers:
+                self._pending_timers[file_path].cancel()
+            timer = threading.Timer(self.debounce_seconds, self._execute_callback, args=[file_path, event_type, callback])
+            self._pending_timers[file_path] = timer
+            timer.start()
+
+    def _execute_callback(self, file_path: str, event_type: str, callback):
+        with self._timers_lock:
+            self._pending_timers.pop(file_path, None)
+        callback()
+
+    def cleanup(self):
+        with self._timers_lock:
+            for timer in self._pending_timers.values():
+                timer.cancel()
+            self._pending_timers.clear()
 
     def on_created(self, event):
         if not event.is_directory:
@@ -17,15 +40,31 @@ class FileMonitorHandler(FileSystemEventHandler):
 
     def on_modified(self, event):
         if not event.is_directory:
-            self.logger.info(f"文件修改: {event.src_path}")
+            file_path = event.src_path
+            self._debounce(
+                file_path,
+                "modified",
+                lambda: self.logger.info(f"文件修改: {file_path}")
+            )
 
     def on_deleted(self, event):
         if not event.is_directory:
-            self.logger.info(f"文件删除: {event.src_path}")
+            file_path = event.src_path
+            with self._timers_lock:
+                if file_path in self._pending_timers:
+                    self._pending_timers[file_path].cancel()
+                    self._pending_timers.pop(file_path, None)
+            self.logger.info(f"文件删除: {file_path}")
 
     def on_moved(self, event):
         if not event.is_directory:
-            self.logger.info(f"文件重命名: {event.src_path} -> {event.dest_path}")
+            src_path = event.src_path
+            dest_path = event.dest_path
+            with self._timers_lock:
+                if src_path in self._pending_timers:
+                    self._pending_timers[src_path].cancel()
+                    self._pending_timers.pop(src_path, None)
+            self.logger.info(f"文件重命名: {src_path} -> {dest_path}")
 
 
 def setup_logger(log_file: str = None) -> logging.Logger:
@@ -67,6 +106,12 @@ def main():
         dest="log_file",
         help="日志文件路径 (可选)"
     )
+    parser.add_argument(
+        "-d", "--debounce",
+        type=float,
+        default=1.0,
+        help="防抖时间（秒），同一文件在此时间内的多次修改会被合并 (默认: 1.0)"
+    )
 
     args = parser.parse_args()
 
@@ -79,12 +124,13 @@ def main():
         sys.exit(1)
 
     logger = setup_logger(args.log_file)
-    event_handler = FileMonitorHandler(logger)
+    event_handler = FileMonitorHandler(logger, debounce_seconds=args.debounce)
     observer = Observer()
     observer.schedule(event_handler, str(watch_dir), recursive=args.recursive)
 
     logger.info(f"开始监控目录: {watch_dir}")
     logger.info(f"递归监控: {'是' if args.recursive else '否'}")
+    logger.info(f"防抖时间: {args.debounce} 秒")
     if args.log_file:
         logger.info(f"日志文件: {args.log_file}")
     logger.info("按 Ctrl+C 停止监控...")
@@ -97,6 +143,7 @@ def main():
     except KeyboardInterrupt:
         logger.info("接收到停止信号，正在停止监控...")
         observer.stop()
+        event_handler.cleanup()
 
     observer.join()
     logger.info("监控服务已停止")
