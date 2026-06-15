@@ -1,19 +1,56 @@
 import sys
+import json
 import time
 import logging
 import argparse
 import threading
+from datetime import datetime
 from pathlib import Path
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileModifiedEvent, FileDeletedEvent, FileMovedEvent
 
 
 class FileMonitorHandler(FileSystemEventHandler):
-    def __init__(self, logger: logging.Logger, debounce_seconds: float = 1.0):
+    def __init__(self, logger: logging.Logger, debounce_seconds: float = 1.0, webhook_url: str = None):
         self.logger = logger
         self.debounce_seconds = debounce_seconds
+        self.webhook_url = webhook_url
         self._pending_timers: dict[str, threading.Timer] = {}
         self._timers_lock = threading.Lock()
+
+    def _post_webhook(self, event_type: str, file_path: str, dest_path: str = None):
+        if not self.webhook_url:
+            return
+
+        payload = {
+            "event": event_type,
+            "path": file_path,
+            "timestamp": datetime.now().isoformat(),
+        }
+        if dest_path:
+            payload["dest_path"] = dest_path
+
+        def _send():
+            try:
+                data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                req = Request(
+                    self.webhook_url,
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(req, timeout=10) as resp:
+                    self.logger.debug(f"WebHook 响应: {resp.status}")
+            except HTTPError as e:
+                self.logger.warning(f"WebHook 返回错误: HTTP {e.code} - {e.reason}")
+            except URLError as e:
+                self.logger.warning(f"WebHook 连接失败: {e.reason}")
+            except Exception as e:
+                self.logger.warning(f"WebHook 推送异常: {e}")
+
+        threading.Thread(target=_send, daemon=True).start()
 
     def _debounce(self, file_path: str, event_type: str, callback):
         with self._timers_lock:
@@ -37,6 +74,7 @@ class FileMonitorHandler(FileSystemEventHandler):
     def on_created(self, event):
         if not event.is_directory:
             self.logger.info(f"文件创建: {event.src_path}")
+            self._post_webhook("created", event.src_path)
 
     def on_modified(self, event):
         if not event.is_directory:
@@ -44,7 +82,10 @@ class FileMonitorHandler(FileSystemEventHandler):
             self._debounce(
                 file_path,
                 "modified",
-                lambda: self.logger.info(f"文件修改: {file_path}")
+                lambda: (
+                    self.logger.info(f"文件修改: {file_path}"),
+                    self._post_webhook("modified", file_path),
+                )
             )
 
     def on_deleted(self, event):
@@ -55,6 +96,7 @@ class FileMonitorHandler(FileSystemEventHandler):
                     self._pending_timers[file_path].cancel()
                     self._pending_timers.pop(file_path, None)
             self.logger.info(f"文件删除: {file_path}")
+            self._post_webhook("deleted", file_path)
 
     def on_moved(self, event):
         if not event.is_directory:
@@ -65,6 +107,7 @@ class FileMonitorHandler(FileSystemEventHandler):
                     self._pending_timers[src_path].cancel()
                     self._pending_timers.pop(src_path, None)
             self.logger.info(f"文件重命名: {src_path} -> {dest_path}")
+            self._post_webhook("moved", src_path, dest_path)
 
 
 def setup_logger(log_file: str = None) -> logging.Logger:
@@ -112,6 +155,11 @@ def main():
         default=1.0,
         help="防抖时间（秒），同一文件在此时间内的多次修改会被合并 (默认: 1.0)"
     )
+    parser.add_argument(
+        "-w", "--webhook",
+        dest="webhook_url",
+        help="WebHook URL，事件发生时 POST JSON 到该地址 (可选)"
+    )
 
     args = parser.parse_args()
 
@@ -124,13 +172,15 @@ def main():
         sys.exit(1)
 
     logger = setup_logger(args.log_file)
-    event_handler = FileMonitorHandler(logger, debounce_seconds=args.debounce)
+    event_handler = FileMonitorHandler(logger, debounce_seconds=args.debounce, webhook_url=args.webhook_url)
     observer = Observer()
     observer.schedule(event_handler, str(watch_dir), recursive=args.recursive)
 
     logger.info(f"开始监控目录: {watch_dir}")
     logger.info(f"递归监控: {'是' if args.recursive else '否'}")
     logger.info(f"防抖时间: {args.debounce} 秒")
+    if args.webhook_url:
+        logger.info(f"WebHook: {args.webhook_url}")
     if args.log_file:
         logger.info(f"日志文件: {args.log_file}")
     logger.info("按 Ctrl+C 停止监控...")
